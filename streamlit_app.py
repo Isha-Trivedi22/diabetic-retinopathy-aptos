@@ -1,28 +1,26 @@
+import json
 import cv2
 import numpy as np
 import streamlit as st
 import tensorflow as tf
 from PIL import Image
 
-IMG = 256
+CFG = json.load(open("thresholds.json"))
+TH, IMG = np.array(CFG["thresholds"]), CFG["size"]
 LABELS = ["0 - No DR", "1 - Mild", "2 - Moderate", "3 - Severe", "4 - Proliferative DR"]
 
 
 @st.cache_resource
 def get_model():
-    return tf.keras.models.load_model("dr_model.keras")
+    return tf.keras.models.load_model("dr_model_reg.keras")
 
 
-# ---- same image-processing functions as the training notebook ----
 def crop_black(img, tol=7):
     m = img.mean(axis=2) > tol
     if m.sum() == 0:
         return img
     ys, xs = np.where(m)
     return img[ys.min():ys.max(), xs.min():xs.max()]
-
-def load_rgb(img, size=IMG):
-    return cv2.resize(crop_black(img), (size, size))
 
 def enhance(img, size=IMG):
     return cv2.addWeighted(img, 4, cv2.GaussianBlur(img, (0, 0), size / 30), -4, 128)
@@ -46,10 +44,10 @@ def optic_disc_mask(g, fov, r=28):
     return m
 
 def keep_blobs(mask, min_area, max_area, max_aspect):
-    n, lab, st, _ = cv2.connectedComponentsWithStats(mask, 8)
+    n, lab, st_, _ = cv2.connectedComponentsWithStats(mask, 8)
     out = np.zeros_like(mask)
     for i in range(1, n):
-        x, y, w, h, a = st[i]
+        x, y, w, h, a = st_[i]
         asp = max(w, h) / max(1, min(w, h))
         if min_area <= a <= max_area and asp <= max_aspect:
             out[lab == i] = 255
@@ -68,36 +66,35 @@ def segment(img):
         t = np.percentile(x[fov > 0], pct)
         return ((x > t) * 255).astype(np.uint8)
 
-    b = thr(b, 97)
-    d = thr(d, 96)
-    b = cv2.morphologyEx(b, cv2.MORPH_OPEN, sm)
-    d = cv2.morphologyEx(d, cv2.MORPH_OPEN, sm)
-    b = cv2.bitwise_and(b, fov)
-    d = cv2.bitwise_and(d, fov)
-    b[od > 0] = 0
-    d[od > 0] = 0
+    b = cv2.morphologyEx(thr(b, 97), cv2.MORPH_OPEN, sm)
+    d = cv2.morphologyEx(thr(d, 96), cv2.MORPH_OPEN, sm)
+    b = cv2.bitwise_and(b, fov); d = cv2.bitwise_and(d, fov)
+    b[od > 0] = 0; d[od > 0] = 0
     return keep_blobs(b, 4, 400, 3.5), keep_blobs(d, 3, 150, 3.0)
-
 
 
 st.set_page_config(page_title="DR Grading (APTOS 2019)", page_icon="👁️")
 st.title("Diabetic Retinopathy Grading (APTOS 2019)")
-st.caption("EfficientNetB0 classifier + classical image-processing lesion overlay. "
+st.caption("EfficientNetB0 ordinal-regression grader + classical image-processing lesion overlay. "
            "Educational project - NOT a medical diagnosis tool.")
 
 file = st.file_uploader("Upload a retinal fundus image", type=["png", "jpg", "jpeg"])
 if file is not None:
     image = np.array(Image.open(file).convert("RGB"))
-    img = load_rgb(image)
-    x = enhance(img).astype(np.float32)[None]          # raw 0-255, same as training
-    probs = get_model().predict(x, verbose=0)[0]
-    bright, dark = segment(img)
-    overlay = img.copy()
-    overlay[bright > 0] = [255, 255, 0]                # yellow = bright lesion candidates
-    overlay[dark > 0] = [255, 0, 0]                    # red = dark lesion candidates
+    img = cv2.resize(crop_black(image), (IMG, IMG))
+    x = enhance(img).astype(np.float32)[None]
+    model = get_model()
+    score = float((model.predict(x, verbose=0)[0][0] + model.predict(x[:, :, ::-1], verbose=0)[0][0]) / 2)
+    grade = int(np.digitize(score, TH))
 
-    col1, col2 = st.columns(2)
-    col1.image(img, caption="Input (cropped, resized)")
-    col2.image(overlay, caption="Lesion candidates (yellow = bright, red = dark)")
-    st.subheader("Predicted grade: " + LABELS[int(probs.argmax())])
-    st.bar_chart({LABELS[i]: float(probs[i]) for i in range(5)})
+    small = cv2.resize(img, (256, 256))
+    bright, dark = segment(small)
+    overlay = small.copy()
+    overlay[bright > 0] = [255, 255, 0]
+    overlay[dark > 0] = [255, 0, 0]
+
+    c1, c2 = st.columns(2)
+    c1.image(img, caption="Input (cropped, resized)")
+    c2.image(overlay, caption="Lesion candidates (yellow = bright, red = dark)")
+    st.subheader("Predicted grade: " + LABELS[grade])
+    st.write(f"Model severity score: {score:.2f} (0 = healthy, 4 = most severe)")
